@@ -1,0 +1,129 @@
+#pragma kernel FilterDepthMap
+#pragma kernel GenerateVertexBuffer
+
+// 共通パラメータ
+uint width;
+uint height;
+float outlierThreshold;
+float depthThreshold;
+
+// 入出力バッファ
+RWStructuredBuffer<float3> inputVertices;
+RWStructuredBuffer<float3> outputVertices;
+RWStructuredBuffer<int> validityMask;
+RWStructuredBuffer<uint> indirectArgs;
+
+// 有効な点のカウント用のアトミックカウンター
+RWStructuredBuffer<uint> counter;
+
+// 近傍画素の深度値をチェックしてノイズを除去する
+[numthreads(8, 8, 1)]
+void FilterDepthMap(uint3 id : SV_DispatchThreadID)
+{
+    // 範囲外の場合は処理しない
+    if (id.x >= width || id.y >= height)
+        return;
+
+    uint index = id.y * width + id.x;
+    
+    // 中心点が無効（深度ゼロ）の場合はスキップ
+    float3 center = inputVertices[index];
+    if (length(center) == 0.0f)
+    {
+        validityMask[index] = 0;
+        outputVertices[index] = float3(0, 0, 0);
+        return;
+    }
+    
+    // 窓サイズ
+    const int windowSize = 3;
+    const int halfWindow = windowSize / 2;
+    
+    // エッジ付近はスキップ（十分な近傍点がない）
+    if (id.x < halfWindow || id.x >= width - halfWindow || 
+        id.y < halfWindow || id.y >= height - halfWindow)
+    {
+        validityMask[index] = 1;
+        outputVertices[index] = center;
+        return;
+    }
+    
+    // 近傍点の深度値を収集
+    float depths[9]; // 3x3の窓
+    int validCount = 0;
+    
+    for (int dy = -halfWindow; dy <= halfWindow; dy++)
+    {
+        for (int dx = -halfWindow; dx <= halfWindow; dx++)
+        {
+            uint nIdx = (id.y + dy) * width + (id.x + dx);
+            float3 p = inputVertices[nIdx];
+            if (length(p) > 0.0f)
+            {
+                depths[validCount] = p.z;
+                validCount++;
+            }
+        }
+    }
+    
+    // 有効な深度値が少なすぎる場合
+    if (validCount < 4)
+    {
+        validityMask[index] = 1;
+        outputVertices[index] = center;
+        return;
+    }
+    
+    // 深度値のソート（単純な挿入ソート）
+    for (int i = 1; i < validCount; i++)
+    {
+        float key = depths[i];
+        int j = i - 1;
+        while (j >= 0 && depths[j] > key)
+        {
+            depths[j + 1] = depths[j];
+            j--;
+        }
+        depths[j + 1] = key;
+    }
+    
+    // 中央値の計算
+    float medianDepth = depths[validCount / 2];
+    
+    // 中央値から外れ値の場合
+    if (abs(center.z - medianDepth) > outlierThreshold)
+    {
+        validityMask[index] = 0;
+        outputVertices[index] = float3(0, 0, 0);
+    }
+    else
+    {
+        validityMask[index] = 1;
+        outputVertices[index] = center;
+        
+        // 有効な点をカウント（アトミック操作）
+        InterlockedAdd(counter[0], 1);
+    }
+}
+
+// 有効な頂点のみを抽出してコンパクトなバッファを生成
+[numthreads(64, 1, 1)]
+void GenerateVertexBuffer(uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x;
+    if (index >= width * height)
+        return;
+    
+    if (validityMask[index] == 1)
+    {
+        // 有効な点のインデックスを取得
+        uint validIndex;
+        InterlockedAdd(counter[1], 1, validIndex);
+        
+        // 出力バッファに書き込み
+        if (validIndex < indirectArgs[0])
+        {
+            indirectArgs[1 + validIndex] = index;
+        }
+    }
+} 

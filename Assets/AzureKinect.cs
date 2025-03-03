@@ -4,6 +4,7 @@ using UnityEngine;
 using Microsoft.Azure.Kinect.Sensor;
 using System.Threading.Tasks;
 using System.Linq;
+using System.Runtime.InteropServices;
 
 public class MultiKinectMeshScript : MonoBehaviour
 {
@@ -24,6 +25,12 @@ public class MultiKinectMeshScript : MonoBehaviour
     public bool enableNoiseFiltering = true;
     [Tooltip("中央値からの外れ値を検出するしきい値。大きくするとノイズ除去が弱くなる")]
     public float outlierThreshold = 0.1f;
+
+    // GPU高速化オプション
+    [Header("GPU高速化")]
+    [Tooltip("GPUを使用して処理を高速化")]
+    public bool useGPUAcceleration = true;
+    public ComputeShader pointCloudProcessor;
 
     // Kinect2の手動調整パラメータ（Inspectorで調整可能）
     public Vector3 kinect2ManualPosition = new Vector3(-0.39f, 0.11f, -1.13f);
@@ -62,6 +69,34 @@ public class MultiKinectMeshScript : MonoBehaviour
     // Kinect2用Mesh表示オブジェクト
     private GameObject kinect2Object;
 
+    // GPUリソース
+    private ComputeBuffer inputVertexBuffer1;
+    private ComputeBuffer outputVertexBuffer1;
+    private ComputeBuffer validityMaskBuffer1;
+    private ComputeBuffer indirectArgsBuffer1;
+    private ComputeBuffer counterBuffer1;
+
+    private ComputeBuffer inputVertexBuffer2;
+    private ComputeBuffer outputVertexBuffer2;
+    private ComputeBuffer validityMaskBuffer2;
+    private ComputeBuffer indirectArgsBuffer2;
+    private ComputeBuffer counterBuffer2;
+
+    // ComputeShaderのカーネルID
+    private int filterDepthMapKernelId;
+    private int generateVertexBufferKernelId;
+
+    // キャプチャ用のデータバッファ
+    private Short3[] xyzBuffer1;
+    private BGRA[] colorBuffer1;
+    private Short3[] xyzBuffer2;
+    private BGRA[] colorBuffer2;
+
+    // フレームレート計測用
+    private float frameTime;
+    private int frameCount;
+    private float fps;
+
     void Start()
     {
         // マテリアルが未設定なら作成
@@ -95,6 +130,13 @@ public class MultiKinectMeshScript : MonoBehaviour
             pointCloudMaterial.SetFloat("_PointSize", pointSize);
         }
 
+        // ComputeShaderが設定されていない場合、GPU高速化を無効化
+        if (pointCloudProcessor == null && useGPUAcceleration)
+        {
+            Debug.LogWarning("ComputeShaderが設定されていないため、GPU高速化を無効化します。");
+            useGPUAcceleration = false;
+        }
+
         // デバイス初期化
         InitKinectDevices();
 
@@ -105,9 +147,43 @@ public class MultiKinectMeshScript : MonoBehaviour
         // 外部校正パラメータから変換行列セットアップ
         SetupExternalTransformation();
 
+        // GPU処理を初期化
+        if (useGPUAcceleration)
+        {
+            InitGPUResources();
+        }
+
         // 非同期に各デバイスの点群更新ループを開始
         Task t1 = KinectLoop1();
         Task t2 = KinectLoop2();
+    }
+
+    // GPU処理用のリソースを初期化
+    private void InitGPUResources()
+    {
+        // ComputeShaderのカーネルIDを取得
+        filterDepthMapKernelId = pointCloudProcessor.FindKernel("FilterDepthMap");
+        generateVertexBufferKernelId = pointCloudProcessor.FindKernel("GenerateVertexBuffer");
+
+        // Kinect1用のGPUバッファ
+        inputVertexBuffer1 = new ComputeBuffer(num1, sizeof(float) * 3);
+        outputVertexBuffer1 = new ComputeBuffer(num1, sizeof(float) * 3);
+        validityMaskBuffer1 = new ComputeBuffer(num1, sizeof(int));
+        indirectArgsBuffer1 = new ComputeBuffer(num1 + 1, sizeof(uint));
+        counterBuffer1 = new ComputeBuffer(2, sizeof(uint));
+
+        // Kinect2用のGPUバッファ
+        inputVertexBuffer2 = new ComputeBuffer(num2, sizeof(float) * 3);
+        outputVertexBuffer2 = new ComputeBuffer(num2, sizeof(float) * 3);
+        validityMaskBuffer2 = new ComputeBuffer(num2, sizeof(int));
+        indirectArgsBuffer2 = new ComputeBuffer(num2 + 1, sizeof(uint));
+        counterBuffer2 = new ComputeBuffer(2, sizeof(uint));
+
+        // バッファ割り当て
+        xyzBuffer1 = new Short3[num1];
+        colorBuffer1 = new BGRA[num1];
+        xyzBuffer2 = new Short3[num2];
+        colorBuffer2 = new BGRA[num2];
     }
 
     // Kinectの初期化（両デバイス）
@@ -250,41 +326,117 @@ public class MultiKinectMeshScript : MonoBehaviour
             using (Capture capture = await Task.Run(() => kinect1.GetCapture()).ConfigureAwait(true))
             {
                 // カラー画像をDepthカメラに合わせる
-                Image colorImage = transformation1.ColorImageToDepthCamera(capture);
-                BGRA[] colorArray = colorImage.GetPixels<BGRA>().ToArray();
-
-                // Depth画像から点群を取得（(x, y, z)）
-                Image xyzImage = transformation1.DepthImageToPointCloud(capture.Depth);
-                Short3[] xyzArray = xyzImage.GetPixels<Short3>().ToArray();
-
-                for (int i = 0; i < num1; i++)
+                using (Image colorImage = transformation1.ColorImageToDepthCamera(capture))
                 {
-                    // Kinect1は (x, -y, z) に変換
-                    vertices1[i] = new Vector3(
-                        xyzArray[i].X * 0.001f,
-                        -xyzArray[i].Y * 0.001f,
-                        xyzArray[i].Z * 0.001f
-                    );
-                    colors1[i] = new Color32(
-                        colorArray[i].R,
-                        colorArray[i].G,
-                        colorArray[i].B,
-                        255
-                    );
+                    // Depth画像から点群を取得（(x, y, z)）
+                    using (Image xyzImage = transformation1.DepthImageToPointCloud(capture.Depth))
+                    {
+                        // バッファに一括コピー（GC軽減）
+                        BGRA[] tempColorArray = colorImage.GetPixels<BGRA>().ToArray();
+                        Short3[] tempXyzArray = xyzImage.GetPixels<Short3>().ToArray();
+
+                        // 手動でバッファにコピー
+                        System.Array.Copy(tempColorArray, 0, colorBuffer1, 0, tempColorArray.Length);
+                        System.Array.Copy(tempXyzArray, 0, xyzBuffer1, 0, tempXyzArray.Length);
+
+                        if (useGPUAcceleration)
+                        {
+                            // GPU処理による高速化
+                            ProcessPointCloudGPU1(xyzBuffer1, colorBuffer1);
+                        }
+                        else
+                        {
+                            // CPU処理
+                            ProcessPointCloudCPU1(xyzBuffer1, colorBuffer1);
+                        }
+                    }
                 }
-
-                // 点群をフィルタリングしてノイズを除去
-                vertices1 = FilterPointCloud(vertices1, width1, height1);
-
-                // 頂点・カラー更新
-                mesh1.vertices = vertices1;
-                mesh1.colors32 = colors1;
-                // インデックスリストの再構築
-                List<int> indiceList = GetIndiceList(vertices1, width1, height1, meshTopology);
-                mesh1.SetIndices(indiceList, meshTopology, 0);
-                mesh1.RecalculateBounds();
             }
         }
+    }
+
+    // GPU処理によるKinect1点群処理
+    private void ProcessPointCloudGPU1(Short3[] xyzArray, BGRA[] colorArray)
+    {
+        // 点群データをGPUに転送
+        Vector3[] tempVertices = new Vector3[num1];
+        for (int i = 0; i < num1; i++)
+        {
+            tempVertices[i] = new Vector3(
+                xyzArray[i].X * 0.001f,
+                -xyzArray[i].Y * 0.001f,
+                xyzArray[i].Z * 0.001f
+            );
+            colors1[i] = new Color32(
+                colorArray[i].R,
+                colorArray[i].G,
+                colorArray[i].B,
+                255
+            );
+        }
+
+        // ComputeBufferにデータを設定
+        inputVertexBuffer1.SetData(tempVertices);
+
+        // カウンターをリセット
+        uint[] counterData = new uint[2] { 0, 0 };
+        counterBuffer1.SetData(counterData);
+
+        // ComputeShaderにパラメータ設定
+        pointCloudProcessor.SetBuffer(filterDepthMapKernelId, "inputVertices", inputVertexBuffer1);
+        pointCloudProcessor.SetBuffer(filterDepthMapKernelId, "outputVertices", outputVertexBuffer1);
+        pointCloudProcessor.SetBuffer(filterDepthMapKernelId, "validityMask", validityMaskBuffer1);
+        pointCloudProcessor.SetBuffer(filterDepthMapKernelId, "counter", counterBuffer1);
+        pointCloudProcessor.SetFloat("outlierThreshold", outlierThreshold);
+        pointCloudProcessor.SetFloat("depthThreshold", depthDiscontinuityThreshold);
+        pointCloudProcessor.SetInt("width", width1);
+        pointCloudProcessor.SetInt("height", height1);
+
+        // フィルタリングカーネル実行
+        pointCloudProcessor.Dispatch(filterDepthMapKernelId, Mathf.CeilToInt(width1 / 8f), Mathf.CeilToInt(height1 / 8f), 1);
+
+        // 有効な点データを読み取り
+        outputVertexBuffer1.GetData(vertices1);
+
+        // 頂点・カラー更新
+        mesh1.vertices = vertices1;
+        mesh1.colors32 = colors1;
+
+        // インデックスリストの再構築
+        List<int> indiceList = GetIndiceList(vertices1, width1, height1, meshTopology);
+        mesh1.SetIndices(indiceList, meshTopology, 0);
+        mesh1.RecalculateBounds();
+    }
+
+    // 従来のCPU処理によるKinect1点群処理
+    private void ProcessPointCloudCPU1(Short3[] xyzArray, BGRA[] colorArray)
+    {
+        for (int i = 0; i < num1; i++)
+        {
+            // Kinect1は (x, -y, z) に変換
+            vertices1[i] = new Vector3(
+                xyzArray[i].X * 0.001f,
+                -xyzArray[i].Y * 0.001f,
+                xyzArray[i].Z * 0.001f
+            );
+            colors1[i] = new Color32(
+                colorArray[i].R,
+                colorArray[i].G,
+                colorArray[i].B,
+                255
+            );
+        }
+
+        // 点群をフィルタリングしてノイズを除去
+        vertices1 = FilterPointCloud(vertices1, width1, height1);
+
+        // 頂点・カラー更新
+        mesh1.vertices = vertices1;
+        mesh1.colors32 = colors1;
+        // インデックスリストの再構築
+        List<int> indiceList = GetIndiceList(vertices1, width1, height1, meshTopology);
+        mesh1.SetIndices(indiceList, meshTopology, 0);
+        mesh1.RecalculateBounds();
     }
 
     // Kinect2の点群取得・更新ループ（外部校正変換適用）
@@ -294,39 +446,145 @@ public class MultiKinectMeshScript : MonoBehaviour
         {
             using (Capture capture = await Task.Run(() => kinect2.GetCapture()).ConfigureAwait(true))
             {
-                Image colorImage = transformation2.ColorImageToDepthCamera(capture);
-                BGRA[] colorArray = colorImage.GetPixels<BGRA>().ToArray();
-
-                Image xyzImage = transformation2.DepthImageToPointCloud(capture.Depth);
-                Short3[] xyzArray = xyzImage.GetPixels<Short3>().ToArray();
-
-                for (int i = 0; i < num2; i++)
+                using (Image colorImage = transformation2.ColorImageToDepthCamera(capture))
                 {
-                    // Kinect2のraw点（ミリ→メートル換算のみ）
-                    Vector3 rawPoint = new Vector3(
-                        xyzArray[i].X * 0.001f,
-                        xyzArray[i].Y * 0.001f,
-                        xyzArray[i].Z * 0.001f
-                    );
-                    // 外部校正変換を適用し、Kinect1と同じくy軸反転して合わせる
-                    vertices2[i] = transform2To1.MultiplyPoint3x4(rawPoint);
-                    colors2[i] = new Color32(
-                        colorArray[i].R,
-                        colorArray[i].G,
-                        colorArray[i].B,
-                        255
-                    );
+                    using (Image xyzImage = transformation2.DepthImageToPointCloud(capture.Depth))
+                    {
+                        // バッファに一括コピー（GC軽減）
+                        BGRA[] tempColorArray = colorImage.GetPixels<BGRA>().ToArray();
+                        Short3[] tempXyzArray = xyzImage.GetPixels<Short3>().ToArray();
+
+                        // 手動でバッファにコピー
+                        System.Array.Copy(tempColorArray, 0, colorBuffer2, 0, tempColorArray.Length);
+                        System.Array.Copy(tempXyzArray, 0, xyzBuffer2, 0, tempXyzArray.Length);
+
+                        if (useGPUAcceleration)
+                        {
+                            // GPU処理による高速化
+                            ProcessPointCloudGPU2(xyzBuffer2, colorBuffer2);
+                        }
+                        else
+                        {
+                            // CPU処理
+                            ProcessPointCloudCPU2(xyzBuffer2, colorBuffer2);
+                        }
+                    }
                 }
-
-                // 点群をフィルタリングしてノイズを除去
-                vertices2 = FilterPointCloud(vertices2, width2, height2);
-
-                mesh2.vertices = vertices2;
-                mesh2.colors32 = colors2;
-                List<int> indiceList = GetIndiceList(vertices2, width2, height2, meshTopology);
-                mesh2.SetIndices(indiceList, meshTopology, 0);
-                mesh2.RecalculateBounds();
             }
+        }
+    }
+
+    // GPU処理によるKinect2点群処理
+    private void ProcessPointCloudGPU2(Short3[] xyzArray, BGRA[] colorArray)
+    {
+        // 点群データをGPUに転送
+        Vector3[] tempVertices = new Vector3[num2];
+        for (int i = 0; i < num2; i++)
+        {
+            // Kinect2のraw点（ミリ→メートル換算のみ）
+            Vector3 rawPoint = new Vector3(
+                xyzArray[i].X * 0.001f,
+                xyzArray[i].Y * 0.001f,
+                xyzArray[i].Z * 0.001f
+            );
+            // 外部校正変換を適用し、Kinect1と同じくy軸反転して合わせる
+            tempVertices[i] = transform2To1.MultiplyPoint3x4(rawPoint);
+            colors2[i] = new Color32(
+                colorArray[i].R,
+                colorArray[i].G,
+                colorArray[i].B,
+                255
+            );
+        }
+
+        // ComputeBufferにデータを設定
+        inputVertexBuffer2.SetData(tempVertices);
+
+        // カウンターをリセット
+        uint[] counterData = new uint[2] { 0, 0 };
+        counterBuffer2.SetData(counterData);
+
+        // ComputeShaderにパラメータ設定
+        pointCloudProcessor.SetBuffer(filterDepthMapKernelId, "inputVertices", inputVertexBuffer2);
+        pointCloudProcessor.SetBuffer(filterDepthMapKernelId, "outputVertices", outputVertexBuffer2);
+        pointCloudProcessor.SetBuffer(filterDepthMapKernelId, "validityMask", validityMaskBuffer2);
+        pointCloudProcessor.SetBuffer(filterDepthMapKernelId, "counter", counterBuffer2);
+        pointCloudProcessor.SetFloat("outlierThreshold", outlierThreshold);
+        pointCloudProcessor.SetFloat("depthThreshold", depthDiscontinuityThreshold);
+        pointCloudProcessor.SetInt("width", width2);
+        pointCloudProcessor.SetInt("height", height2);
+
+        // フィルタリングカーネル実行
+        pointCloudProcessor.Dispatch(filterDepthMapKernelId, Mathf.CeilToInt(width2 / 8f), Mathf.CeilToInt(height2 / 8f), 1);
+
+        // 有効な点データを読み取り
+        outputVertexBuffer2.GetData(vertices2);
+
+        // 頂点・カラー更新
+        mesh2.vertices = vertices2;
+        mesh2.colors32 = colors2;
+
+        // インデックスリストの再構築
+        List<int> indiceList = GetIndiceList(vertices2, width2, height2, meshTopology);
+        mesh2.SetIndices(indiceList, meshTopology, 0);
+        mesh2.RecalculateBounds();
+    }
+
+    // 従来のCPU処理によるKinect2点群処理
+    private void ProcessPointCloudCPU2(Short3[] xyzArray, BGRA[] colorArray)
+    {
+        for (int i = 0; i < num2; i++)
+        {
+            // Kinect2のraw点（ミリ→メートル換算のみ）
+            Vector3 rawPoint = new Vector3(
+                xyzArray[i].X * 0.001f,
+                xyzArray[i].Y * 0.001f,
+                xyzArray[i].Z * 0.001f
+            );
+            // 外部校正変換を適用し、Kinect1と同じくy軸反転して合わせる
+            vertices2[i] = transform2To1.MultiplyPoint3x4(rawPoint);
+            colors2[i] = new Color32(
+                colorArray[i].R,
+                colorArray[i].G,
+                colorArray[i].B,
+                255
+            );
+        }
+
+        // 点群をフィルタリングしてノイズを除去
+        vertices2 = FilterPointCloud(vertices2, width2, height2);
+
+        mesh2.vertices = vertices2;
+        mesh2.colors32 = colors2;
+        List<int> indiceList = GetIndiceList(vertices2, width2, height2, meshTopology);
+        mesh2.SetIndices(indiceList, meshTopology, 0);
+        mesh2.RecalculateBounds();
+    }
+
+    // フレームレート計測と表示
+    void Update()
+    {
+        frameCount++;
+        frameTime += Time.deltaTime;
+
+        if (frameTime >= 1.0f)
+        {
+            fps = frameCount / frameTime;
+            frameCount = 0;
+            frameTime = 0;
+        }
+    }
+
+    void OnGUI()
+    {
+        // フレームレートとモード表示
+        string mode = useGPUAcceleration ? "GPU Mode" : "CPU Mode";
+        GUI.Label(new Rect(10, 10, 200, 20), $"FPS: {fps:F1} - {mode}");
+
+        // GPU/CPUモード切り替えボタン
+        if (pointCloudProcessor != null && GUI.Button(new Rect(10, 40, 150, 30), "Switch GPU/CPU"))
+        {
+            useGPUAcceleration = !useGPUAcceleration;
         }
     }
 
@@ -343,6 +601,19 @@ public class MultiKinectMeshScript : MonoBehaviour
             kinect2.StopCameras();
             kinect2.Dispose();
         }
+
+        // GPUリソース解放
+        if (inputVertexBuffer1 != null) inputVertexBuffer1.Release();
+        if (outputVertexBuffer1 != null) outputVertexBuffer1.Release();
+        if (validityMaskBuffer1 != null) validityMaskBuffer1.Release();
+        if (indirectArgsBuffer1 != null) indirectArgsBuffer1.Release();
+        if (counterBuffer1 != null) counterBuffer1.Release();
+
+        if (inputVertexBuffer2 != null) inputVertexBuffer2.Release();
+        if (outputVertexBuffer2 != null) outputVertexBuffer2.Release();
+        if (validityMaskBuffer2 != null) validityMaskBuffer2.Release();
+        if (indirectArgsBuffer2 != null) indirectArgsBuffer2.Release();
+        if (counterBuffer2 != null) counterBuffer2.Release();
     }
 
     // 頂点配列から、指定のMeshTopologyに応じたindicesリストを生成するメソッド
