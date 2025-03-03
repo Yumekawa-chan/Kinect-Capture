@@ -20,6 +20,8 @@ public class MultiKinectMeshScript : MonoBehaviour
     public bool enableNoiseFiltering = true;
     [Tooltip("中央値からの外れ値を検出するしきい値。大きくするとノイズ除去が弱くなる")]
     public float outlierThreshold = 0.1f;
+    [Tooltip("カメラ原点からの最小距離（メートル）。この距離より近い点は除外される")]
+    public float minDistanceFromOrigin = 0.5f;
 
     [Header("GPU高速化")]
     [Tooltip("GPUを使用して処理を高速化")]
@@ -28,15 +30,20 @@ public class MultiKinectMeshScript : MonoBehaviour
 
     [Header("キャリブレーション設定")]
     public bool useTransposedRotation = true;
-    public Vector3 kinect2ManualPosition = new Vector3(-0.39f, 0.11f, -1.13f);
-    public Vector3 kinect2ManualRotation = new Vector3(0.167f, -0.801f, -4.548f);
+    public Vector3 kinect2ManualPosition = new Vector3(-1.75f, -0.367f, -1.255f);
+    public Vector3 kinect2ManualRotation = new Vector3(-4.579f, 2.335f, -7.826f);
+    public Vector3 kinect3ManualPosition = new Vector3(-0.39f, 0.11f, -1.13f);
+    public Vector3 kinect3ManualRotation = new Vector3(0.167f, -0.801f, -4.548f);
 
     // Kinectデバイス
     private Device kinect1;
     private Device kinect2;
+    private Device kinect3;
     private Transformation transformation1;
     private Transformation transformation2;
+    private Transformation transformation3;
     private Matrix4x4 transform2To1;
+    private Matrix4x4 transform3To1;
 
     // Kinect1用Meshとデータ
     private Mesh mesh1;
@@ -51,16 +58,25 @@ public class MultiKinectMeshScript : MonoBehaviour
     private int num2, width2, height2;
     private GameObject kinect2Object;
 
+    // Kinect3用Meshとデータ
+    private Mesh mesh3;
+    private Vector3[] vertices3;
+    private Color32[] colors3;
+    private int num3, width3, height3;
+    private GameObject kinect3Object;
+
     // GPUリソース
     private ComputeBuffer inputVertexBuffer1, outputVertexBuffer1;
     private ComputeBuffer validityMaskBuffer1, indirectArgsBuffer1, counterBuffer1;
     private ComputeBuffer inputVertexBuffer2, outputVertexBuffer2;
     private ComputeBuffer validityMaskBuffer2, indirectArgsBuffer2, counterBuffer2;
+    private ComputeBuffer inputVertexBuffer3, outputVertexBuffer3;
+    private ComputeBuffer validityMaskBuffer3, indirectArgsBuffer3, counterBuffer3;
     private int filterDepthMapKernelId, generateVertexBufferKernelId;
 
     // データバッファ
-    private Short3[] xyzBuffer1, xyzBuffer2;
-    private BGRA[] colorBuffer1, colorBuffer2;
+    private Short3[] xyzBuffer1, xyzBuffer2, xyzBuffer3;
+    private BGRA[] colorBuffer1, colorBuffer2, colorBuffer3;
 
     // パフォーマンス測定
     private float frameTime, fps;
@@ -72,6 +88,7 @@ public class MultiKinectMeshScript : MonoBehaviour
         InitKinectDevices();
         InitMesh1();
         InitMesh2();
+        InitMesh3();
         SetupExternalTransformation();
 
         if (useGPUAcceleration && pointCloudProcessor != null)
@@ -87,6 +104,7 @@ public class MultiKinectMeshScript : MonoBehaviour
         // 非同期点群処理開始
         Task t1 = KinectLoop1();
         Task t2 = KinectLoop2();
+        Task t3 = KinectLoop3();
     }
 
     private void InitializeMaterial()
@@ -141,11 +159,20 @@ public class MultiKinectMeshScript : MonoBehaviour
         indirectArgsBuffer2 = new ComputeBuffer(num2 + 1, sizeof(uint));
         counterBuffer2 = new ComputeBuffer(2, sizeof(uint));
 
+        // Kinect3用のGPUバッファ
+        inputVertexBuffer3 = new ComputeBuffer(num3, sizeof(float) * 3);
+        outputVertexBuffer3 = new ComputeBuffer(num3, sizeof(float) * 3);
+        validityMaskBuffer3 = new ComputeBuffer(num3, sizeof(int));
+        indirectArgsBuffer3 = new ComputeBuffer(num3 + 1, sizeof(uint));
+        counterBuffer3 = new ComputeBuffer(2, sizeof(uint));
+
         // データバッファ初期化
         xyzBuffer1 = new Short3[num1];
         colorBuffer1 = new BGRA[num1];
         xyzBuffer2 = new Short3[num2];
         colorBuffer2 = new BGRA[num2];
+        xyzBuffer3 = new Short3[num3];
+        colorBuffer3 = new BGRA[num3];
     }
 
     private void InitKinectDevices()
@@ -173,6 +200,18 @@ public class MultiKinectMeshScript : MonoBehaviour
             CameraFPS = FPS.FPS30
         });
         transformation2 = kinect2.GetCalibration().CreateTransformation();
+
+        // Kinect3（デバイス2）
+        kinect3 = Device.Open(2);
+        kinect3.StartCameras(new DeviceConfiguration
+        {
+            ColorFormat = ImageFormat.ColorBGRA32,
+            ColorResolution = ColorResolution.R720p,
+            DepthMode = DepthMode.NFOV_2x2Binned,
+            SynchronizedImagesOnly = true,
+            CameraFPS = FPS.FPS30
+        });
+        transformation3 = kinect3.GetCalibration().CreateTransformation();
     }
 
     private void InitMesh1()
@@ -220,9 +259,33 @@ public class MultiKinectMeshScript : MonoBehaviour
         kinect2Object.transform.eulerAngles = kinect2ManualRotation;
     }
 
+    private void InitMesh3()
+    {
+        width3 = kinect3.GetCalibration().DepthCameraCalibration.ResolutionWidth;
+        height3 = kinect3.GetCalibration().DepthCameraCalibration.ResolutionHeight;
+        num3 = width3 * height3;
+
+        mesh3 = new Mesh();
+        mesh3.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
+        vertices3 = new Vector3[num3];
+        colors3 = new Color32[num3];
+
+        mesh3.vertices = vertices3;
+        mesh3.colors32 = colors3;
+
+        kinect3Object = new GameObject("Kinect3_PointCloud");
+        MeshFilter mf3 = kinect3Object.AddComponent<MeshFilter>();
+        mf3.mesh = mesh3;
+        MeshRenderer mr3 = kinect3Object.AddComponent<MeshRenderer>();
+        mr3.material = pointCloudMaterial;
+
+        kinect3Object.transform.position = kinect3ManualPosition;
+        kinect3Object.transform.eulerAngles = kinect3ManualRotation;
+    }
+
     private void SetupExternalTransformation()
     {
-        // 外部校正パラメータ（OpenCV/Open3D前提）
+        // 外部校正パラメータ（OpenCV/Open3D前提）- Kinect1とKinect3の変換行列
         float r11 = 0.8107891645868455f;
         float r12 = 0.0019960699214603833f;
         float r13 = -0.5853349009698925f;
@@ -261,7 +324,44 @@ public class MultiKinectMeshScript : MonoBehaviour
         Matrix4x4 invertY = Matrix4x4.identity;
         invertY[1, 1] = -1;
 
-        transform2To1 = invertY * T_ext;
+        transform3To1 = invertY * T_ext;
+
+        // Kinect1とKinect2の変換行列（新しいキャリブレーションデータ）
+        float r11_k2 = -0.290368614886442f;
+        float r12_k2 = 0.08630691944008534f;
+        float r13_k2 = -0.9530147864255266f;
+        float r21_k2 = -0.3465773266935342f;
+        float r22_k2 = 0.9188231758419758f;
+        float r23_k2 = 0.18880711892730462f;
+        float r31_k2 = 0.8919474334908378f;
+        float r32_k2 = 0.3851169785823896f;
+        float r33_k2 = -0.23688539148009716f;
+
+        // 並進（ミリ→メートル換算）
+        float t_x_k2 = -1725.6317057591953f * 0.001f;
+        float t_y_k2 = -943.2676613586739f * 0.001f;
+        float t_z_k2 = 3704.1407079824903f * 0.001f;
+
+        Matrix4x4 R_k2 = Matrix4x4.identity;
+        if (useTransposedRotation)
+        {
+            R_k2.SetRow(0, new Vector4(r11_k2, r21_k2, r31_k2, 0));
+            R_k2.SetRow(1, new Vector4(r12_k2, r22_k2, r32_k2, 0));
+            R_k2.SetRow(2, new Vector4(r13_k2, r23_k2, r33_k2, 0));
+        }
+        else
+        {
+            R_k2.SetRow(0, new Vector4(r11_k2, r12_k2, r13_k2, 0));
+            R_k2.SetRow(1, new Vector4(r21_k2, r22_k2, r23_k2, 0));
+            R_k2.SetRow(2, new Vector4(r31_k2, r32_k2, r33_k2, 0));
+        }
+
+        Matrix4x4 T_ext_k2 = Matrix4x4.identity;
+        T_ext_k2.SetRow(0, new Vector4(R_k2[0, 0], R_k2[0, 1], R_k2[0, 2], t_x_k2));
+        T_ext_k2.SetRow(1, new Vector4(R_k2[1, 0], R_k2[1, 1], R_k2[1, 2], t_y_k2));
+        T_ext_k2.SetRow(2, new Vector4(R_k2[2, 0], R_k2[2, 1], R_k2[2, 2], t_z_k2));
+
+        transform2To1 = invertY * T_ext_k2;
     }
 
     private async Task KinectLoop1()
@@ -393,12 +493,27 @@ public class MultiKinectMeshScript : MonoBehaviour
         Vector3[] tempVertices = new Vector3[num2];
         for (int i = 0; i < num2; i++)
         {
-            Vector3 rawPoint = new Vector3(
-                xyzArray[i].X * 0.001f,
-                xyzArray[i].Y * 0.001f,
-                xyzArray[i].Z * 0.001f
-            );
-            tempVertices[i] = transform2To1.MultiplyPoint3x4(rawPoint);
+            // 原点からの距離を計算
+            float distanceFromOrigin = Mathf.Sqrt(
+                xyzArray[i].X * xyzArray[i].X +
+                xyzArray[i].Y * xyzArray[i].Y +
+                xyzArray[i].Z * xyzArray[i].Z) * 0.001f;
+
+            // 距離が最小距離より小さい場合は点を除外（ゼロベクトルに設定）
+            if (distanceFromOrigin < minDistanceFromOrigin || xyzArray[i].Z <= 0)
+            {
+                tempVertices[i] = Vector3.zero;
+            }
+            else
+            {
+                Vector3 rawPoint = new Vector3(
+                    xyzArray[i].X * 0.001f,
+                    xyzArray[i].Y * 0.001f,
+                    xyzArray[i].Z * 0.001f
+                );
+                tempVertices[i] = transform2To1.MultiplyPoint3x4(rawPoint);
+            }
+
             colors2[i] = new Color32(
                 colorArray[i].R,
                 colorArray[i].G,
@@ -434,6 +549,19 @@ public class MultiKinectMeshScript : MonoBehaviour
     {
         for (int i = 0; i < num2; i++)
         {
+            // 原点からの距離を計算
+            float distanceFromOrigin = Mathf.Sqrt(
+                xyzArray[i].X * xyzArray[i].X +
+                xyzArray[i].Y * xyzArray[i].Y +
+                xyzArray[i].Z * xyzArray[i].Z) * 0.001f;
+
+            // 距離が最小距離より小さい場合は点を除外（ゼロベクトルに設定）
+            if (distanceFromOrigin < minDistanceFromOrigin || xyzArray[i].Z <= 0)
+            {
+                vertices2[i] = Vector3.zero;
+                continue;
+            }
+
             Vector3 rawPoint = new Vector3(
                 xyzArray[i].X * 0.001f,
                 xyzArray[i].Y * 0.001f,
@@ -454,6 +582,131 @@ public class MultiKinectMeshScript : MonoBehaviour
         }
 
         UpdateMesh(mesh2, vertices2, colors2, width2, height2);
+    }
+
+    private async Task KinectLoop3()
+    {
+        while (true)
+        {
+            using (Capture capture = await Task.Run(() => kinect3.GetCapture()).ConfigureAwait(true))
+            using (Image colorImage = transformation3.ColorImageToDepthCamera(capture))
+            using (Image xyzImage = transformation3.DepthImageToPointCloud(capture.Depth))
+            {
+                // データの取得とバッファへのコピー
+                BGRA[] tempColorArray = colorImage.GetPixels<BGRA>().ToArray();
+                Short3[] tempXyzArray = xyzImage.GetPixels<Short3>().ToArray();
+
+                System.Array.Copy(tempColorArray, 0, colorBuffer3, 0, tempColorArray.Length);
+                System.Array.Copy(tempXyzArray, 0, xyzBuffer3, 0, tempXyzArray.Length);
+
+                // 点群処理
+                if (useGPUAcceleration && pointCloudProcessor != null)
+                {
+                    ProcessPointCloudGPU3(xyzBuffer3, colorBuffer3);
+                }
+                else
+                {
+                    ProcessPointCloudCPU3(xyzBuffer3, colorBuffer3);
+                }
+            }
+        }
+    }
+
+    private void ProcessPointCloudGPU3(Short3[] xyzArray, BGRA[] colorArray)
+    {
+        // 点群データ変換と外部校正適用
+        Vector3[] tempVertices = new Vector3[num3];
+        for (int i = 0; i < num3; i++)
+        {
+            // 原点からの距離を計算
+            float distanceFromOrigin = Mathf.Sqrt(
+                xyzArray[i].X * xyzArray[i].X +
+                xyzArray[i].Y * xyzArray[i].Y +
+                xyzArray[i].Z * xyzArray[i].Z) * 0.001f;
+
+            // 距離が最小距離より小さい場合は点を除外（ゼロベクトルに設定）
+            if (distanceFromOrigin < minDistanceFromOrigin || xyzArray[i].Z <= 0)
+            {
+                tempVertices[i] = Vector3.zero;
+            }
+            else
+            {
+                Vector3 rawPoint = new Vector3(
+                    xyzArray[i].X * 0.001f,
+                    xyzArray[i].Y * 0.001f,
+                    xyzArray[i].Z * 0.001f
+                );
+                tempVertices[i] = transform3To1.MultiplyPoint3x4(rawPoint);
+            }
+
+            colors3[i] = new Color32(
+                colorArray[i].R,
+                colorArray[i].G,
+                colorArray[i].B,
+                255
+            );
+        }
+
+        // GPU処理
+        inputVertexBuffer3.SetData(tempVertices);
+
+        uint[] counterData = new uint[2] { 0, 0 };
+        counterBuffer3.SetData(counterData);
+
+        pointCloudProcessor.SetBuffer(filterDepthMapKernelId, "inputVertices", inputVertexBuffer3);
+        pointCloudProcessor.SetBuffer(filterDepthMapKernelId, "outputVertices", outputVertexBuffer3);
+        pointCloudProcessor.SetBuffer(filterDepthMapKernelId, "validityMask", validityMaskBuffer3);
+        pointCloudProcessor.SetBuffer(filterDepthMapKernelId, "counter", counterBuffer3);
+        pointCloudProcessor.SetFloat("outlierThreshold", outlierThreshold);
+        pointCloudProcessor.SetFloat("depthThreshold", depthDiscontinuityThreshold);
+        pointCloudProcessor.SetInt("width", width3);
+        pointCloudProcessor.SetInt("height", height3);
+
+        pointCloudProcessor.Dispatch(filterDepthMapKernelId, Mathf.CeilToInt(width3 / 8f), Mathf.CeilToInt(height3 / 8f), 1);
+
+        // 結果の取得とメッシュ更新
+        outputVertexBuffer3.GetData(vertices3);
+
+        UpdateMesh(mesh3, vertices3, colors3, width3, height3);
+    }
+
+    private void ProcessPointCloudCPU3(Short3[] xyzArray, BGRA[] colorArray)
+    {
+        for (int i = 0; i < num3; i++)
+        {
+            // 原点からの距離を計算
+            float distanceFromOrigin = Mathf.Sqrt(
+                xyzArray[i].X * xyzArray[i].X +
+                xyzArray[i].Y * xyzArray[i].Y +
+                xyzArray[i].Z * xyzArray[i].Z) * 0.001f;
+
+            // 距離が最小距離より小さい場合は点を除外（ゼロベクトルに設定）
+            if (distanceFromOrigin < minDistanceFromOrigin || xyzArray[i].Z <= 0)
+            {
+                vertices3[i] = Vector3.zero;
+                continue;
+            }
+
+            Vector3 rawPoint = new Vector3(
+                xyzArray[i].X * 0.001f,
+                xyzArray[i].Y * 0.001f,
+                xyzArray[i].Z * 0.001f
+            );
+            vertices3[i] = transform3To1.MultiplyPoint3x4(rawPoint);
+            colors3[i] = new Color32(
+                colorArray[i].R,
+                colorArray[i].G,
+                colorArray[i].B,
+                255
+            );
+        }
+
+        if (enableNoiseFiltering)
+        {
+            vertices3 = FilterPointCloud(vertices3, width3, height3);
+        }
+
+        UpdateMesh(mesh3, vertices3, colors3, width3, height3);
     }
 
     // メッシュの更新処理を統合
@@ -505,6 +758,11 @@ public class MultiKinectMeshScript : MonoBehaviour
             kinect2.StopCameras();
             kinect2.Dispose();
         }
+        if (kinect3 != null)
+        {
+            kinect3.StopCameras();
+            kinect3.Dispose();
+        }
 
         // GPUリソース解放
         ReleaseComputeBuffer(ref inputVertexBuffer1);
@@ -518,6 +776,12 @@ public class MultiKinectMeshScript : MonoBehaviour
         ReleaseComputeBuffer(ref validityMaskBuffer2);
         ReleaseComputeBuffer(ref indirectArgsBuffer2);
         ReleaseComputeBuffer(ref counterBuffer2);
+
+        ReleaseComputeBuffer(ref inputVertexBuffer3);
+        ReleaseComputeBuffer(ref outputVertexBuffer3);
+        ReleaseComputeBuffer(ref validityMaskBuffer3);
+        ReleaseComputeBuffer(ref indirectArgsBuffer3);
+        ReleaseComputeBuffer(ref counterBuffer3);
     }
 
     private void ReleaseComputeBuffer(ref ComputeBuffer buffer)

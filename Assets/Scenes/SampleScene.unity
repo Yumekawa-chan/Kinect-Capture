@@ -1389,11 +1389,14 @@ MonoBehaviour:
   depthDiscontinuityThreshold: 0.05
   enableNoiseFiltering: 1
   outlierThreshold: 0.1
+  minDistanceFromOrigin: 0.5
   useGPUAcceleration: 1
   pointCloudProcessor: {fileID: 7200000, guid: 03779a74e42719249975a3b30a40e33a, type: 3}
   useTransposedRotation: 1
-  kinect2ManualPosition: {x: -0.325, y: 0.051, z: -1.085}
-  kinect2ManualRotation: {x: 0.017, y: -0.079, z: -2.087}
+  kinect2ManualPosition: {x: -1.75, y: -0.367, z: -1.255}
+  kinect2ManualRotation: {x: -4.579, y: 2.335, z: -7.826}
+  kinect3ManualPosition: {x: -0.39, y: 0.11, z: -1.13}
+  kinect3ManualRotation: {x: 0.167, y: -0.801, z: -4.548}
 --- !u!1 &230121672
 GameObject:
   m_ObjectHideFlags: 0
